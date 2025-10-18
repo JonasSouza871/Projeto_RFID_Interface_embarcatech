@@ -47,6 +47,7 @@ pico_sdk_init()
 add_executable(RFID
     main.c
     lib/mfrc522.c
+    lib/pico_http_server.c
 )
 
 # Configurações do programa
@@ -66,6 +67,7 @@ target_include_directories(RFID PRIVATE
 # Bibliotecas necessárias
 target_link_libraries(RFID
     pico_stdlib
+    pico_cyw43_arch_lwip_poll
     hardware_spi
     hardware_i2c
     hardware_uart
