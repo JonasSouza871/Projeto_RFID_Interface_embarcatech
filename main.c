@@ -51,6 +51,7 @@ void show_menu(void);
 void register_item(MFRC522Ptr_t mfrc);
 void identify_item(MFRC522Ptr_t mfrc);
 void list_items(void);
+void rename_item(MFRC522Ptr_t mfrc);
 int find_item_by_uid(uint8_t *uid, uint8_t uid_size);
 void print_uid(uint8_t *uid, uint8_t size);
 void read_line(char *buffer, int max_len);
@@ -107,6 +108,9 @@ int main() {
                 list_items();
                 break;
             case '4':
+                rename_item(mfrc);
+                break;
+            case '5':
                 printf("Encerrando sistema...\n");
                 return 0;
             default:
@@ -152,7 +156,8 @@ void show_menu(void) {
     printf("1 - Cadastrar novo item\n");
     printf("2 - Identificar item\n");
     printf("3 - Listar itens cadastrados\n");
-    printf("4 - Sair\n");
+    printf("4 - Renomear item\n");
+    printf("5 - Sair\n");
     printf("========================================\n");
     printf("Escolha uma opcao: ");
 }
@@ -375,6 +380,94 @@ void list_items(void) {
             printf("\n\n");
         }
     }
+}
+
+/**
+ * Renomeia um item cadastrado
+ */
+void rename_item(MFRC522Ptr_t mfrc) {
+    printf("\n--- RENOMEAR ITEM ---\n\n");
+
+    if (database.count == 0) {
+        printf("Nenhum item cadastrado para renomear.\n\n");
+        return;
+    }
+
+    printf("Aproxime o cartao RFID do leitor...\n");
+
+    // Aguardar leitura do cartão (timeout de 10 segundos)
+    int timeout = 100; // 10 segundos
+    bool card_read = false;
+
+    while (timeout > 0 && !card_read) {
+        if (PICC_IsNewCardPresent(mfrc)) {
+            if (PICC_ReadCardSerial(mfrc)) {
+                card_read = true;
+                break;
+            }
+        }
+        sleep_ms(100);
+        timeout--;
+    }
+
+    if (!card_read) {
+        printf("Timeout: Nenhum cartao detectado!\n\n");
+        return;
+    }
+
+    // Buscar item
+    int item_index = find_item_by_uid(mfrc->uid.uidByte, mfrc->uid.size);
+
+    printf("\n");
+    printf("UID lido: ");
+    print_uid(mfrc->uid.uidByte, mfrc->uid.size);
+    printf("\n\n");
+
+    if (item_index == -1) {
+        printf("** Item nao cadastrado **\n");
+        printf("Utilize a opcao 1 para cadastrar.\n\n");
+        PCD_StopCrypto1(mfrc);
+        return;
+    }
+
+    // Exibir nome atual
+    printf("========================================\n");
+    printf("Item encontrado!\n");
+    printf("Nome atual: %s\n", database.items[item_index].name);
+    printf("========================================\n\n");
+
+    // Solicitar novo nome
+    printf("Digite o novo nome do item: ");
+    char new_name[MAX_NAME_LEN];
+    read_line(new_name, MAX_NAME_LEN);
+
+    // Validar nome
+    if (strlen(new_name) == 0) {
+        printf("Erro: Nome invalido! Renomeacao cancelada.\n\n");
+        PCD_StopCrypto1(mfrc);
+        return;
+    }
+
+    // Salvar nome antigo para exibir confirmação
+    char old_name[MAX_NAME_LEN];
+    strncpy(old_name, database.items[item_index].name, MAX_NAME_LEN);
+
+    // Atualizar nome
+    strncpy(database.items[item_index].name, new_name, MAX_NAME_LEN - 1);
+    database.items[item_index].name[MAX_NAME_LEN - 1] = '\0';
+
+    printf("\n** Item renomeado com sucesso! **\n");
+    printf("Nome anterior: %s\n", old_name);
+    printf("Nome novo: %s\n", database.items[item_index].name);
+    printf("UID: ");
+    print_uid(database.items[item_index].uid, database.items[item_index].uid_size);
+    printf("\n\n");
+
+    // Salvar na flash
+    save_database();
+    printf("Alteracao salva na memoria!\n\n");
+
+    PCD_StopCrypto1(mfrc);
 }
 
 /**
