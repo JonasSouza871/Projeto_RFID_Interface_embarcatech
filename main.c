@@ -1,7 +1,8 @@
-/*
- * Projeto RFID - Raspberry Pi Pico
- * Sistema de cadastro e identificação de itens via RFID
- */
+// =====================================================
+// Sistema RFID - Raspberry Pi Pico W
+// Cadastro e identificação de itens via RFID
+// Interface web + Serial
+// =====================================================
 
 #include <stdio.h>
 #include <string.h>
@@ -13,144 +14,150 @@
 #include "mfrc522.h"
 #include "pico_http_server.h"
 
-// Configurações WiFi
-#define WIFI_ENABLED    1                      // Mude para 0 para desabilitar WiFi
-#define WIFI_SSID       "NOME_REDE"     // Altere para o nome da sua rede
-#define WIFI_PASSWORD   "SENHA_REDE"            // Altere para a senha da sua rede
+// ========== CONFIGURAÇÕES ==========
 
+// Configurações de WiFi
+#define WIFI_ENABLED    1                  // 1 = WiFi habilitado, 0 = apenas serial
+#define WIFI_SSID       "NOME_REDE"        // Nome da rede WiFi
+#define WIFI_PASSWORD   "SENHA_REDE"       // Senha da rede WiFi
 
-// Pinagem do MFRC522
-#define PIN_MISO    4   // GP4 - Master In Slave Out
-#define PIN_CS      5   // GP5 - Chip Select (SDA)
-#define PIN_SCK     2   // GP2 - Clock SPI
-#define PIN_MOSI    3   // GP3 - Master Out Slave In
-#define PIN_RST     0   // GP0 - Reset
+// Pinagem do leitor RFID MFRC522
+#define PIN_MISO    4                      // SPI MISO (Master In Slave Out)
+#define PIN_CS      5                      // SPI CS (Chip Select)
+#define PIN_SCK     2                      // SPI Clock
+#define PIN_MOSI    3                      // SPI MOSI (Master Out Slave In)
+#define PIN_RST     0                      // Reset do MFRC522
 
 // Configurações de armazenamento
-#define MAX_ITEMS       50      // Número máximo de itens cadastrados
-#define MAX_NAME_LEN    32      // Tamanho máximo do nome do item
-#define UID_SIZE        10      // Tamanho máximo do UID
+#define MAX_ITEMS       50                 // Máximo de itens que podem ser cadastrados
+#define MAX_NAME_LEN    32                 // Tamanho máximo do nome de um item
+#define UID_SIZE        10                 // Tamanho máximo do UID do cartão RFID
 
 // Configurações de memória flash
-#define FLASH_TARGET_OFFSET (256 * 1024)  // 256KB offset na flash
-#define FLASH_MAGIC_NUMBER  0x52464944    // "RFID" em hexadecimal
+#define FLASH_TARGET_OFFSET (256 * 1024)   // Offset de 256KB na flash para salvar dados
+#define FLASH_MAGIC_NUMBER  0x52464944     // Número mágico "RFID" para validar dados
 
-// Estrutura para armazenar item cadastrado
+// ========== ESTRUTURAS DE DADOS ==========
+
+// Estrutura que representa um item cadastrado
 typedef struct {
-    uint8_t uid[UID_SIZE];      // UID do cartão RFID
-    uint8_t uid_size;           // Tamanho real do UID
-    char name[MAX_NAME_LEN];    // Nome do item
-    bool active;                // Item ativo ou vazio
+    uint8_t uid[UID_SIZE];           // UID único do cartão RFID
+    uint8_t uid_size;                // Tamanho real do UID (varia de 4 a 10 bytes)
+    char name[MAX_NAME_LEN];         // Nome descritivo do item
+    bool active;                     // true = slot ocupado, false = slot vazio
 } RFIDItem;
 
-// Banco de dados de itens em memória
+// Estrutura do banco de dados completo
 typedef struct {
-    uint32_t magic;             // Número mágico para validação
-    RFIDItem items[MAX_ITEMS];
-    uint32_t count;             // Número de itens cadastrados
+    uint32_t magic;                  // Número mágico para validar dados na flash
+    RFIDItem items[MAX_ITEMS];       // Array de todos os itens
+    uint32_t count;                  // Quantidade de itens ativos
 } RFIDDatabase;
 
-// Variável global do banco de dados
+// ========== VARIÁVEIS GLOBAIS ==========
+
+// Banco de dados principal (salvo na RAM e flash)
 RFIDDatabase database = {0};
 
-// Flag para controle do WiFi
+// Flag que indica se WiFi está funcionando
 bool wifi_enabled = false;
 
-// Protótipos de funções
-void setup_gpio(void);
-void show_menu(void);
-void register_item(MFRC522Ptr_t mfrc);
-void identify_item(MFRC522Ptr_t mfrc);
-void list_items(void);
-void rename_item(MFRC522Ptr_t mfrc);
-int find_item_by_uid(uint8_t *uid, uint8_t uid_size);
-void print_uid(uint8_t *uid, uint8_t size);
-void read_line(char *buffer, int max_len);
-void save_database(void);
-void load_database(void);
+// Variáveis para controle de operações via web
+// (volatile porque são acessadas no loop principal e nos handlers HTTP)
+volatile bool web_register_mode = false;        // true = aguardando cartão para cadastro
+volatile bool web_identify_mode = false;        // true = aguardando cartão para identificação
+volatile bool web_rename_mode = false;          // true = aguardando cartão para renomear
+volatile char web_item_name[MAX_NAME_LEN] = {0}; // Nome temporário para operações web
+volatile uint8_t last_uid[UID_SIZE] = {0};      // Último UID lido
+volatile uint8_t last_uid_size = 0;             // Tamanho do último UID
+volatile char last_item_found[MAX_NAME_LEN] = {0}; // Resultado da última identificação
 
-// Funções do servidor web
-const char* handle_get_items(const char *req);
-const char* handle_get_status(const char *req);
-const char* handle_register_mode(const char *req);
-const char* handle_identify_mode(const char *req);
-const char* handle_rename_mode(const char *req);
-const char* handle_delete_item(const char *req);
-void init_web_server(void);
+// ========== PROTÓTIPOS DE FUNÇÕES ==========
 
-// Variáveis de controle para operações web
-volatile bool web_register_mode = false;
-volatile bool web_identify_mode = false;
-volatile bool web_rename_mode = false;
-volatile char web_item_name[MAX_NAME_LEN] = {0};
-volatile uint8_t last_uid[UID_SIZE] = {0};
-volatile uint8_t last_uid_size = 0;
-volatile char last_item_found[MAX_NAME_LEN] = {0};
+// Funções de operação via serial
+void setup_gpio(void);                              // Configura pinos GPIO e SPI
+void show_menu(void);                               // Exibe menu no serial
+void register_item(MFRC522Ptr_t mfrc);             // Cadastra novo item via serial
+void identify_item(MFRC522Ptr_t mfrc);             // Identifica item via serial
+void list_items(void);                              // Lista todos os itens no serial
+void rename_item(MFRC522Ptr_t mfrc);               // Renomeia item via serial
+void read_line(char *buffer, int max_len);          // Lê linha de entrada do usuário
+
+// Funções de gerenciamento do banco de dados
+int find_item_by_uid(uint8_t *uid, uint8_t uid_size); // Busca item pelo UID
+void print_uid(uint8_t *uid, uint8_t size);          // Imprime UID formatado
+void save_database(void);                             // Salva database na flash
+void load_database(void);                             // Carrega database da flash
+
+// Handlers HTTP (APIs REST)
+const char* handle_get_items(const char *req);       // GET /api/items - Lista itens
+const char* handle_get_status(const char *req);      // GET /api/status - Status do sistema
+const char* handle_register_mode(const char *req);   // GET /api/register - Cadastrar
+const char* handle_identify_mode(const char *req);   // GET /api/identify - Identificar
+const char* handle_rename_mode(const char *req);     // GET /api/rename - Renomear
+const char* handle_delete_item(const char *req);     // GET /api/delete - Deletar
+void init_web_server(void);                           // Inicializa servidor web
+
+// ========== FUNÇÃO PRINCIPAL ==========
 
 int main() {
-    // Inicializar stdio primeiro
+    // Inicializa comunicação serial (USB e UART)
     stdio_init_all();
-    sleep_ms(3000);  // Tempo maior para estabilizar o serial
+    sleep_ms(3000);  // Aguarda estabilização
 
     printf("\n========================================\n");
     printf("  Sistema de Cadastro RFID\n");
     printf("========================================\n\n");
 
-    // Carregar banco de dados da flash
+    // Carrega dados salvos da memória flash
     load_database();
 
 #if WIFI_ENABLED
-    // Inicializar WiFi ANTES do SPI para RFID
+    // Inicializa WiFi e servidor web (deve ser antes do SPI do RFID)
     printf("Inicializando WiFi...\n");
-    printf("IMPORTANTE: WiFi deve inicializar antes do RFID!\n\n");
     init_web_server();
-
-    // Pequeno delay após WiFi
     sleep_ms(1000);
 #else
     printf("WiFi desabilitado (WIFI_ENABLED = 0)\n");
-    printf("Sistema funcionara apenas via serial.\n\n");
 #endif
 
-    // Configurar GPIO do MFRC522 DEPOIS do WiFi
+    // Configura hardware do leitor RFID
     printf("\nConfigurando RFID...\n");
     setup_gpio();
 
-    // Inicializar MFRC522
+    // Inicializa biblioteca MFRC522
     MFRC522Ptr_t mfrc = MFRC522_Init();
-
     if (mfrc == NULL) {
         printf("Erro: Falha ao inicializar MFRC522!\n");
-        while(1) {
-            sleep_ms(1000);
-        }
+        while(1) sleep_ms(1000);  // Trava em caso de erro
     }
 
-    // Inicializar comunicação SPI e MFRC522
+    // Inicializa comunicação com o chip RFID
     PCD_Init(mfrc, spi0);
-    printf("MFRC522 inicializado com sucesso!\n");
-    printf("Itens carregados: %lu\n\n", database.count);
+    printf("MFRC522 OK! Itens cadastrados: %lu\n\n", database.count);
 
-    // Loop principal
+    // ========== LOOP PRINCIPAL ==========
+    // Processa requisições WiFi e entrada serial continuamente
     while (1) {
 #if WIFI_ENABLED
-        // Processar requisições WiFi continuamente
         if (wifi_enabled) {
+            // Processa pacotes WiFi/TCP pendentes
             cyw43_arch_poll();
-            sleep_ms(1);  // Pequeno delay para não sobrecarregar
+            sleep_ms(1);
 
-            // Processar operações web com RFID
+            // Processa operações RFID iniciadas via web
             if (web_register_mode || web_identify_mode || web_rename_mode) {
+                // Verifica se há cartão próximo ao leitor
                 if (PICC_IsNewCardPresent(mfrc) && PICC_ReadCardSerial(mfrc)) {
-                    // Salvar UID lido
+                    // Salva UID lido
                     memcpy((void*)last_uid, mfrc->uid.uidByte, mfrc->uid.size);
                     last_uid_size = mfrc->uid.size;
 
+                    // MODO CADASTRO VIA WEB
                     if (web_register_mode) {
-                        // Cadastrar item
                         int existing = find_item_by_uid(mfrc->uid.uidByte, mfrc->uid.size);
                         if (existing == -1 && strlen((const char*)web_item_name) > 0) {
-                            // Encontrar slot vazio
+                            // Encontra slot vazio e cadastra
                             for (int i = 0; i < MAX_ITEMS; i++) {
                                 if (!database.items[i].active) {
                                     memcpy(database.items[i].uid, mfrc->uid.uidByte, mfrc->uid.size);
@@ -159,7 +166,7 @@ int main() {
                                     database.items[i].active = true;
                                     database.count++;
                                     save_database();
-                                    printf("[WEB] Item cadastrado: %s\n", web_item_name);
+                                    printf("[WEB] Cadastrado: %s\n", web_item_name);
                                     break;
                                 }
                             }
@@ -167,142 +174,110 @@ int main() {
                         web_register_mode = false;
                         memset((void*)web_item_name, 0, MAX_NAME_LEN);
                     }
+                    // MODO IDENTIFICAÇÃO VIA WEB
                     else if (web_identify_mode) {
-                        // Identificar item
-                        int item_index = find_item_by_uid(mfrc->uid.uidByte, mfrc->uid.size);
-                        if (item_index != -1) {
-                            strncpy((char*)last_item_found, database.items[item_index].name, MAX_NAME_LEN - 1);
-                            printf("[WEB] Item identificado: %s\n", last_item_found);
+                        int idx = find_item_by_uid(mfrc->uid.uidByte, mfrc->uid.size);
+                        if (idx != -1) {
+                            strncpy((char*)last_item_found, database.items[idx].name, MAX_NAME_LEN - 1);
+                            printf("[WEB] Identificado: %s\n", last_item_found);
                         } else {
                             strcpy((char*)last_item_found, "NAO_CADASTRADO");
                         }
                         web_identify_mode = false;
                     }
+                    // MODO RENOMEAR VIA WEB
                     else if (web_rename_mode) {
-                        // Renomear item
-                        int item_index = find_item_by_uid(mfrc->uid.uidByte, mfrc->uid.size);
-                        if (item_index != -1 && strlen((const char*)web_item_name) > 0) {
-                            strncpy(database.items[item_index].name, (const char*)web_item_name, MAX_NAME_LEN - 1);
+                        int idx = find_item_by_uid(mfrc->uid.uidByte, mfrc->uid.size);
+                        if (idx != -1 && strlen((const char*)web_item_name) > 0) {
+                            strncpy(database.items[idx].name, (const char*)web_item_name, MAX_NAME_LEN - 1);
                             save_database();
-                            printf("[WEB] Item renomeado: %s\n", web_item_name);
+                            printf("[WEB] Renomeado: %s\n", web_item_name);
                         }
                         web_rename_mode = false;
                         memset((void*)web_item_name, 0, MAX_NAME_LEN);
                     }
-
-                    PCD_StopCrypto1(mfrc);
+                    PCD_StopCrypto1(mfrc);  // Finaliza comunicação com cartão
                 }
             }
         }
 #endif
 
-        // Verificar se há entrada disponível (não bloquear)
+        // Verifica se há entrada do usuário no serial (não bloqueia)
         int c = getchar_timeout_us(0);
+        if (c == PICO_ERROR_TIMEOUT) continue;  // Nenhuma tecla, volta ao início
 
-        if (c == PICO_ERROR_TIMEOUT) {
-            // Nenhuma tecla pressionada, continuar loop
-            continue;
-        }
-
-        // Tecla foi pressionada
+        // Processa comando do usuário
         char option = (char)c;
-
-        // Limpar buffer até encontrar newline
+        // Limpa buffer até encontrar Enter
         while (getchar_timeout_us(100000) != '\n' && getchar_timeout_us(0) != PICO_ERROR_TIMEOUT);
 
         show_menu();
-        printf("Opcao escolhida: %c\n\n", option);
+        printf("Opcao: %c\n\n", option);
 
+        // Executa ação baseada na opção
         switch(option) {
-            case '1':
-                register_item(mfrc);
-                break;
-            case '2':
-                identify_item(mfrc);
-                break;
-            case '3':
-                list_items();
-                break;
-            case '4':
-                rename_item(mfrc);
-                break;
-            case '5':
-                printf("Encerrando sistema...\n");
+            case '1': register_item(mfrc); break;   // Cadastrar
+            case '2': identify_item(mfrc); break;   // Identificar
+            case '3': list_items(); break;          // Listar
+            case '4': rename_item(mfrc); break;     // Renomear
+            case '5':                                // Sair
+                printf("Encerrando...\n");
 #if WIFI_ENABLED
-                if (wifi_enabled) {
-                    cyw43_arch_deinit();
-                }
+                if (wifi_enabled) cyw43_arch_deinit();  // Desliga WiFi
 #endif
                 return 0;
             default:
-                printf("Opcao invalida! Tente novamente.\n\n");
+                printf("Opcao invalida!\n\n");
         }
-
         sleep_ms(500);
     }
-
     return 0;
 }
 
-/**
- * Configura os pinos GPIO necessários
- */
+// ========== FUNÇÕES AUXILIARES ==========
+
+// Configura os pinos GPIO e inicializa SPI para o MFRC522
 void setup_gpio(void) {
-    // Configurar pino de reset do MFRC522
+    // Configura pino de reset
     gpio_init(PIN_RST);
     gpio_set_dir(PIN_RST, GPIO_OUT);
-    gpio_put(PIN_RST, 1);  // Reset inativo (high)
+    gpio_put(PIN_RST, 1);  // Reset inativo (HIGH)
 
-    // Configurar SPI
-    spi_init(spi0, 1000000);  // 1 MHz
-
-    // Configurar pinos SPI
+    // Inicializa SPI0 a 1MHz
+    spi_init(spi0, 1000000);
     gpio_set_function(PIN_MISO, GPIO_FUNC_SPI);
     gpio_set_function(PIN_SCK, GPIO_FUNC_SPI);
     gpio_set_function(PIN_MOSI, GPIO_FUNC_SPI);
 
-    // Configurar Chip Select
+    // Configura Chip Select (CS)
     gpio_init(PIN_CS);
     gpio_set_dir(PIN_CS, GPIO_OUT);
-    gpio_put(PIN_CS, 1);  // CS inativo (high)
+    gpio_put(PIN_CS, 1);  // CS inativo (HIGH)
 }
 
-/**
- * Exibe o menu principal
- */
+// Exibe menu de opções no serial
 void show_menu(void) {
     printf("========================================\n");
-    printf("           MENU PRINCIPAL\n");
-    printf("========================================\n");
-    printf("1 - Cadastrar novo item\n");
-    printf("2 - Identificar item\n");
-    printf("3 - Listar itens cadastrados\n");
-    printf("4 - Renomear item\n");
+    printf("1 - Cadastrar  | 2 - Identificar\n");
+    printf("3 - Listar     | 4 - Renomear\n");
     printf("5 - Sair\n");
     printf("========================================\n");
-    printf("Escolha uma opcao: ");
+    printf("Opcao: ");
 }
 
-/**
- * Lê uma linha de entrada do usuário
- */
+// Lê uma linha de texto do usuário via serial
 void read_line(char *buffer, int max_len) {
     int i = 0;
     char c;
-
     while (i < max_len - 1) {
         c = getchar();
-        if (c == '\n' || c == '\r') {
-            break;
-        }
+        if (c == '\n' || c == '\r') break;  // Enter pressionado
         buffer[i++] = c;
     }
-    buffer[i] = '\0';
+    buffer[i] = '\0';  // Finaliza string
 }
 
-/**
- * Imprime UID formatado
- */
+// Imprime UID em formato hexadecimal (ex: A1:B2:C3:D4)
 void print_uid(uint8_t *uid, uint8_t size) {
     for (uint8_t i = 0; i < size; i++) {
         printf("%02X", uid[i]);
@@ -310,15 +285,13 @@ void print_uid(uint8_t *uid, uint8_t size) {
     }
 }
 
-/**
- * Busca item pelo UID
- * Retorna índice do item ou -1 se não encontrado
- */
+// Busca um item no banco de dados pelo UID
+// Retorna: índice do item (0-49) ou -1 se não encontrado
 int find_item_by_uid(uint8_t *uid, uint8_t uid_size) {
     for (int i = 0; i < MAX_ITEMS; i++) {
-        if (database.items[i].active &&
-            database.items[i].uid_size == uid_size) {
-
+        // Verifica se slot está ativo e tamanho do UID confere
+        if (database.items[i].active && database.items[i].uid_size == uid_size) {
+            // Compara byte a byte
             bool match = true;
             for (int j = 0; j < uid_size; j++) {
                 if (database.items[i].uid[j] != uid[j]) {
@@ -326,79 +299,68 @@ int find_item_by_uid(uint8_t *uid, uint8_t uid_size) {
                     break;
                 }
             }
-
-            if (match) {
-                return i;
-            }
+            if (match) return i;  // Encontrado!
         }
     }
-    return -1;
+    return -1;  // Não encontrado
 }
 
-/**
- * Cadastra um novo item
- */
-void register_item(MFRC522Ptr_t mfrc) {
-    printf("\n--- CADASTRO DE ITEM ---\n\n");
+// ========== OPERAÇÕES VIA SERIAL ==========
 
-    // Verificar se há espaço
+// Cadastra um novo item via serial
+// Aguarda cartão por 10 segundos, solicita nome e salva no banco
+void register_item(MFRC522Ptr_t mfrc) {
+    printf("\n--- CADASTRO ---\n");
+
+    // Verifica se há espaço disponível
     if (database.count >= MAX_ITEMS) {
-        printf("Erro: Limite de itens atingido (%d itens)!\n\n", MAX_ITEMS);
+        printf("Limite atingido!\n\n");
         return;
     }
 
-    printf("Aproxime o cartao RFID do leitor...\n");
-
-    // Aguardar leitura do cartão (timeout de 10 segundos)
-    int timeout = 100; // 10 segundos (100 x 100ms)
+    printf("Aproxime o cartao...\n");
+    int timeout = 100;  // 10 segundos (100 x 100ms)
     bool card_read = false;
 
+    // Loop de espera pelo cartão
     while (timeout > 0 && !card_read) {
-        if (PICC_IsNewCardPresent(mfrc)) {
-            if (PICC_ReadCardSerial(mfrc)) {
-                card_read = true;
-                break;
-            }
+        if (PICC_IsNewCardPresent(mfrc) && PICC_ReadCardSerial(mfrc)) {
+            card_read = true;
+            break;
         }
         sleep_ms(100);
         timeout--;
     }
 
     if (!card_read) {
-        printf("Timeout: Nenhum cartao detectado!\n\n");
+        printf("Timeout!\n\n");
         return;
     }
 
-    // Verificar se já está cadastrado
+    // Verifica se já está cadastrado
     int existing = find_item_by_uid(mfrc->uid.uidByte, mfrc->uid.size);
     if (existing != -1) {
-        printf("\nCartao ja cadastrado como: %s\n", database.items[existing].name);
-        printf("UID: ");
-        print_uid(mfrc->uid.uidByte, mfrc->uid.size);
-        printf("\n\n");
+        printf("Ja cadastrado: %s\n", database.items[existing].name);
+        printf("UID: "); print_uid(mfrc->uid.uidByte, mfrc->uid.size); printf("\n\n");
         PCD_StopCrypto1(mfrc);
         return;
     }
 
-    // Exibir UID lido
-    printf("\nCartao detectado!\n");
-    printf("UID: ");
+    // Mostra UID e solicita nome
+    printf("Cartao detectado! UID: ");
     print_uid(mfrc->uid.uidByte, mfrc->uid.size);
-    printf("\n\n");
+    printf("\n\nNome: ");
 
-    // Solicitar nome do item
-    printf("Digite o nome do item: ");
     char item_name[MAX_NAME_LEN];
     read_line(item_name, MAX_NAME_LEN);
 
-    // Validar nome
     if (strlen(item_name) == 0) {
-        printf("Erro: Nome invalido!\n\n");
+        printf("Nome invalido!\n\n");
         PCD_StopCrypto1(mfrc);
         return;
     }
 
-    // Encontrar slot vazio
+    // Encontra primeiro slot vazio
     int slot = -1;
     for (int i = 0; i < MAX_ITEMS; i++) {
         if (!database.items[i].active) {
@@ -407,7 +369,7 @@ void register_item(MFRC522Ptr_t mfrc) {
         }
     }
 
-    // Cadastrar item
+    // Cadastra o item
     memcpy(database.items[slot].uid, mfrc->uid.uidByte, mfrc->uid.size);
     database.items[slot].uid_size = mfrc->uid.size;
     strncpy(database.items[slot].name, item_name, MAX_NAME_LEN - 1);
@@ -415,17 +377,12 @@ void register_item(MFRC522Ptr_t mfrc) {
     database.items[slot].active = true;
     database.count++;
 
-    printf("\n** Item cadastrado com sucesso! **\n");
-    printf("Nome: %s\n", database.items[slot].name);
-    printf("UID: ");
-    print_uid(database.items[slot].uid, database.items[slot].uid_size);
-    printf("\n");
-    printf("Total de itens: %lu\n\n", database.count);
+    printf("Cadastrado: %s\n", database.items[slot].name);
+    printf("Total: %lu\n", database.count);
 
-    // Salvar na flash
+    // Salva na memória flash
     save_database();
-    printf("Dados salvos na memoria!\n\n");
-
+    printf("Salvo!\n\n");
     PCD_StopCrypto1(mfrc);
 }
 
